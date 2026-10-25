@@ -1,0 +1,212 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.9"
+# dependencies = ["soco>=0.30"]
+# ///
+"""Minimal local control for a single Sonos speaker addressed by IP.
+
+Discovery is never used: SSDP/mDNS multicast is filtered on this network,
+so the speaker IP is read from ~/.config/sonos-cli/config.json.
+"""
+
+import argparse
+import json
+import os
+import socket
+import sys
+from pathlib import Path
+
+CONFIG_PATH = Path(
+    os.environ.get("SONOS_CLI_CONFIG", Path.home() / ".config" / "sonos-cli" / "config.json")
+)
+DEFAULT_IP = "192.168.1.113"
+BASS_RANGE = (-10, 10)
+TREBLE_RANGE = (-10, 10)
+VOLUME_RANGE = (0, 100)
+
+
+def load_ip():
+    try:
+        return json.loads(CONFIG_PATH.read_text())["ip"]
+    except (OSError, ValueError, KeyError):
+        return DEFAULT_IP
+
+
+def save_ip(ip):
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps({"ip": ip}, indent=2) + "\n")
+
+
+def fail(message):
+    print(f"sonos: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def player():
+    import soco
+
+    # soco caches SOAP responses, which makes a read straight after a write
+    # return the previous value. A one-shot CLI has nothing to gain from it.
+    soco.config.CACHE_ENABLED = False
+    soco.config.REQUEST_TIMEOUT = 5.0
+    return soco.SoCo(load_ip())
+
+
+def apply(player, name, new_value, attempts=10, delay=0.2):
+    """Write a setting, then confirm the speaker actually took the value."""
+    import time
+
+    setattr(player, name, new_value)
+    latest = getattr(player, name)
+    for _ in range(attempts):
+        if latest == new_value:
+            return latest
+        time.sleep(delay)
+        latest = getattr(player, name)
+    return latest
+
+
+def clamp(value, bounds):
+    low, high = bounds
+    return max(low, min(high, value))
+
+
+def parse_delta(current, token, bounds):
+    """Return the new value for an absolute ("40"), signed ("+5"/"-5") token."""
+    try:
+        if token.startswith(("+", "-")):
+            new = current + int(token)
+        else:
+            new = int(token)
+    except ValueError:
+        fail(f"not a number: {token}")
+    return clamp(new, bounds)
+
+
+def on_off_toggle(current, token):
+    if token == "toggle":
+        return not current
+    if token in ("on", "true", "1"):
+        return True
+    if token in ("off", "false", "0"):
+        return False
+    fail(f"expected on|off|toggle, got: {token}")
+
+
+def add_volume_command(subparsers, name, bounds, help_text):
+    parser = subparsers.add_parser(name, help=help_text)
+    parser.add_argument("value", nargs="?", help="absolute N, or relative +N / -N")
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(
+        prog="sonos",
+        description="Local control for the Sonos speaker at the configured IP.",
+        epilog="Speaker IP is stored in ~/.config/sonos-cli/config.json (default "
+        f"{DEFAULT_IP}).",
+    )
+    subparsers = parser.add_subparsers(dest="command", metavar="COMMAND")
+
+    subparsers.add_parser("status", help="show volume, EQ, loudness and transport state")
+    add_volume_command(subparsers, "vol", VOLUME_RANGE, "get or set volume 0-100")
+    add_volume_command(subparsers, "bass", BASS_RANGE, "get or set bass -10..10")
+    add_volume_command(subparsers, "treble", TREBLE_RANGE, "get or set treble -10..10")
+
+    mute = subparsers.add_parser("mute", help="mute on|off|toggle")
+    mute.add_argument("state", nargs="?", default="toggle")
+
+    loudness = subparsers.add_parser("loudness", help="loudness compensation on|off|toggle")
+    loudness.add_argument("state", nargs="?", default="toggle")
+
+    for action in ("play", "pause", "stop", "next", "previous", "toggle"):
+        subparsers.add_parser(action, help=f"{action} playback")
+
+    ip_parser = subparsers.add_parser("ip", help="show or set the saved speaker IP")
+    ip_parser.add_argument("address", nargs="?")
+
+    args = parser.parse_args(argv)
+    if not args.command:
+        parser.print_help()
+        return 2
+
+    if args.command == "ip":
+        if args.address:
+            save_ip(args.address)
+        elif not CONFIG_PATH.exists():
+            save_ip(load_ip())
+        print(load_ip())
+        return 0
+
+    speaker = player()
+    command = args.command
+
+    if command == "status":
+        transport = speaker.get_current_transport_info()
+        state = transport.get("current_transport_state", "UNKNOWN")
+        line = (
+            f"{speaker.player_name} ({load_ip()})\n"
+            f"  volume {speaker.volume}  mute {'on' if speaker.mute else 'off'}\n"
+            f"  bass {speaker.bass}  treble {speaker.treble}  "
+            f"loudness {'on' if speaker.loudness else 'off'}\n"
+            f"  state {state}"
+        )
+        if state == "PLAYING":
+            track = speaker.get_current_track_info()
+            title, artist = track.get("title"), track.get("artist")
+            if title:
+                line += f"  {title}" + (f" / {artist}" if artist else "")
+        print(line)
+        return 0
+
+    if command == "vol":
+        if args.value is None:
+            print(f"volume {speaker.volume}")
+            return 0
+        new = parse_delta(speaker.volume, args.value, VOLUME_RANGE)
+        print(f"volume {apply(speaker, 'volume', new)}")
+        return 0
+
+    if command in ("bass", "treble"):
+        if args.value is None:
+            print(f"{command} {getattr(speaker, command)}")
+            return 0
+        new = parse_delta(getattr(speaker, command), args.value, BASS_RANGE)
+        print(f"{command} {apply(speaker, command, new)}")
+        return 0
+
+    if command == "mute":
+        new = on_off_toggle(speaker.mute, args.state)
+        print(f"mute {'on' if apply(speaker, 'mute', new) else 'off'}")
+        return 0
+
+    if command == "loudness":
+        new = on_off_toggle(speaker.loudness, args.state)
+        print(f"loudness {'on' if apply(speaker, 'loudness', new) else 'off'}")
+        return 0
+
+    if command == "toggle":
+        state = speaker.get_current_transport_info().get("current_transport_state")
+        getattr(speaker, "pause" if state == "PLAYING" else "play")()
+        print("paused" if state == "PLAYING" else "playing")
+        return 0
+
+    if command in ("play", "pause", "stop", "next", "previous"):
+        getattr(speaker, command)()
+        print(command)
+        return 0
+
+    parser.print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except SystemExit:
+        raise
+    except (socket.timeout, TimeoutError, ConnectionError, OSError) as error:
+        fail(f"cannot reach speaker at {load_ip()}: {error}")
+    except Exception as error:  # soco raises SoCoException for SOAP faults
+        if type(error).__module__.startswith("soco"):
+            fail(str(error))
+        raise
